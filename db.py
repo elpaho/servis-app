@@ -25,6 +25,7 @@ DEFAULT_SETTINGS = {
     "dana_u_servisu": "7",     # N: istakni naloge koji su toliko dana u servisu
     "dana_do_roka": "2",       # M: istakni naloge kojima rok ističe za toliko dana
     "auto_preuzet": "0",       # 1 = nalog se pri završetku odmah označi kao preuzet
+    "zadnji_korisnik": "",     # id zadnje prijavljenog korisnika (predodabir pri prijavi)
 }
 
 
@@ -97,6 +98,15 @@ MIGRATIONS = [
         kljuc TEXT PRIMARY KEY,
         vrijednost TEXT NOT NULL
     );
+    """,
+    # 2: korisnici - lozinka (umjesto PIN-a), tri uloge na nalogu (otvorio / odradio / predao),
+    #    i prvi korisnik "Serviser" bez lozinke ako korisnika još nema
+    """
+    ALTER TABLE korisnik RENAME COLUMN pin_hash TO lozinka_hash;
+    ALTER TABLE nalog RENAME COLUMN zatvorio_korisnik_id TO odradio_korisnik_id;
+    ALTER TABLE nalog ADD COLUMN predao_korisnik_id INTEGER REFERENCES korisnik(id);
+    INSERT INTO korisnik(ime, lozinka_hash)
+        SELECT 'Serviser', '' WHERE NOT EXISTS (SELECT 1 FROM korisnik);
     """,
 ]
 
@@ -197,29 +207,100 @@ def bicikli_klijenta(conn, klijent_id):
     ).fetchall()
 
 
-# ---------------------------------------------------------------- korisnici / PIN
-def _hash_pin(pin: str, salt: bytes = None) -> str:
+# ---------------------------------------------------------------- korisnici / lozinka
+# Prijava služi za bilježenje TKO je što napravio (otvorio / odradio / predao), ne kao sigurnosna
+# zaštita: korisnik bez lozinke se prijavljuje bez nje, a tko ima lozinku, mora je upisati.
+def _hash_lozinka(lozinka: str, salt: bytes = None) -> str:
     salt = salt or os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, 100_000)
+    digest = hashlib.pbkdf2_hmac("sha256", lozinka.encode("utf-8"), salt, 100_000)
     return salt.hex() + "$" + digest.hex()
 
 
-def add_korisnik(conn, ime, pin="") -> int:
+def _check_ime(conn, ime: str, except_id: int = None) -> str:
+    ime = (ime or "").strip()
+    if not ime:
+        raise ValueError("Upiši ime korisnika.")
+    for r in conn.execute("SELECT id, ime FROM korisnik"):
+        if r["id"] != except_id and normalize(r["ime"]) == normalize(ime):
+            raise ValueError(f"Korisnik „{r['ime']}” već postoji.")
+    return ime
+
+
+def add_korisnik(conn, ime, lozinka="") -> int:
+    ime = _check_ime(conn, ime)
     cur = conn.execute(
-        "INSERT INTO korisnik(ime, pin_hash) VALUES (?, ?)", (ime.strip(), _hash_pin(pin) if pin else "")
+        "INSERT INTO korisnik(ime, lozinka_hash) VALUES (?, ?)", (ime, _hash_lozinka(lozinka) if lozinka else "")
     )
     conn.commit()
     return cur.lastrowid
 
 
-def check_pin(conn, korisnik_id: int, pin: str) -> bool:
-    row = conn.execute("SELECT pin_hash FROM korisnik WHERE id = ? AND aktivan = 1", (korisnik_id,)).fetchone()
+def list_korisnici(conn, only_active: bool = True):
+    """Redovi s poljima id, ime, aktivan, ima_lozinku (hash se ne izlaže)."""
+    where = "WHERE aktivan = 1" if only_active else ""
+    return conn.execute(
+        f"SELECT id, ime, aktivan, (lozinka_hash != '') AS ima_lozinku FROM korisnik {where} ORDER BY id"
+    ).fetchall()
+
+
+def get_korisnik(conn, korisnik_id: int):
+    return conn.execute(
+        "SELECT id, ime, aktivan, (lozinka_hash != '') AS ima_lozinku FROM korisnik WHERE id = ?", (korisnik_id,)
+    ).fetchone()
+
+
+def update_korisnik(conn, korisnik_id: int, ime: str = None, aktivan: bool = None):
+    """Promjena imena i/ili aktivnosti. Zadnji aktivni korisnik se ne može deaktivirati."""
+    if ime is not None:
+        conn.execute("UPDATE korisnik SET ime = ? WHERE id = ?", (_check_ime(conn, ime, korisnik_id), korisnik_id))
+    if aktivan is not None:
+        if not aktivan:
+            others = conn.execute(
+                "SELECT COUNT(*) FROM korisnik WHERE aktivan = 1 AND id != ?", (korisnik_id,)
+            ).fetchone()[0]
+            if others == 0:
+                conn.rollback()
+                raise ValueError("Mora ostati barem jedan aktivan korisnik.")
+        conn.execute("UPDATE korisnik SET aktivan = ? WHERE id = ?", (1 if aktivan else 0, korisnik_id))
+    conn.commit()
+
+
+def set_lozinka(conn, korisnik_id: int, lozinka: str):
+    """Prazna lozinka = korisnik se prijavljuje bez lozinke."""
+    conn.execute(
+        "UPDATE korisnik SET lozinka_hash = ? WHERE id = ?", (_hash_lozinka(lozinka) if lozinka else "", korisnik_id)
+    )
+    conn.commit()
+
+
+def check_lozinka(conn, korisnik_id: int, lozinka: str) -> bool:
+    row = conn.execute("SELECT lozinka_hash FROM korisnik WHERE id = ? AND aktivan = 1", (korisnik_id,)).fetchone()
     if row is None:
         return False
-    if not row["pin_hash"]:
-        return True  # korisnik bez PIN-a
-    salt_hex, _ = row["pin_hash"].split("$", 1)
-    return hmac.compare_digest(_hash_pin(pin, bytes.fromhex(salt_hex)), row["pin_hash"])
+    if not row["lozinka_hash"]:
+        return True  # korisnik bez lozinke
+    salt_hex, _ = row["lozinka_hash"].split("$", 1)
+    return hmac.compare_digest(_hash_lozinka(lozinka, bytes.fromhex(salt_hex)), row["lozinka_hash"])
+
+
+RESET_FILE = "reset_lozinki.txt"
+
+
+def reset_lozinke_if_requested(conn, data_dir: str = None) -> bool:
+    """
+    Zaboravljena lozinka: ako u mapi data postoji prazna datoteka reset_lozinki.txt, pri
+    pokretanju se SVIM korisnicima lozinka briše, a datoteka se uklanja.
+    """
+    path = os.path.join(data_dir or get_data_dir(), RESET_FILE)
+    if not os.path.isfile(path):
+        return False
+    conn.execute("UPDATE korisnik SET lozinka_hash = ''")
+    conn.commit()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return True
 
 
 # ---------------------------------------------------------------- nalozi
@@ -255,15 +336,19 @@ def open_nalog(conn, bicikl_id, opis_klijent="", rok=None, korisnik_id=None, tod
 
 
 def finish_nalog(conn, nalog_id, opis_radova, korisnik_id=None, today: date = None):
+    """
+    korisnik_id = tko je ODRADIO. Ako je uključen auto_preuzet, nalog odmah postaje preuzet,
+    a kao onaj tko ga je PREDAO upisuje se isti korisnik.
+    """
     today = today or date.today()
     if get_setting(conn, "auto_preuzet") == "1":
-        status, preuzet = STATUS_PREUZET, today.isoformat()
+        status, preuzet, predao = STATUS_PREUZET, today.isoformat(), korisnik_id
     else:
-        status, preuzet = STATUS_GOTOV, None
+        status, preuzet, predao = STATUS_GOTOV, None, None
     conn.execute(
         "UPDATE nalog SET status = ?, datum_zavrsetka = ?, datum_preuzimanja = ?, "
-        "opis_radova = ?, zatvorio_korisnik_id = ? WHERE id = ?",
-        (status, today.isoformat(), preuzet, opis_radova.strip(), korisnik_id, nalog_id),
+        "opis_radova = ?, odradio_korisnik_id = ?, predao_korisnik_id = ? WHERE id = ?",
+        (status, today.isoformat(), preuzet, opis_radova.strip(), korisnik_id, predao, nalog_id),
     )
     conn.commit()
 
@@ -279,20 +364,25 @@ def delete_nalog(conn, nalog_id: int):
     conn.commit()
 
 
-def mark_preuzet(conn, nalog_id, today: date = None):
+def mark_preuzet(conn, nalog_id, korisnik_id=None, today: date = None):
+    """korisnik_id = tko je bicikl PREDAO klijentu."""
     today = today or date.today()
     conn.execute(
-        "UPDATE nalog SET status = ?, datum_preuzimanja = ? WHERE id = ? AND status = ?",
-        (STATUS_PREUZET, today.isoformat(), nalog_id, STATUS_GOTOV),
+        "UPDATE nalog SET status = ?, datum_preuzimanja = ?, predao_korisnik_id = ? WHERE id = ? AND status = ?",
+        (STATUS_PREUZET, today.isoformat(), korisnik_id, nalog_id, STATUS_GOTOV),
     )
     conn.commit()
 
 
 _NALOG_SELECT = """
-    SELECT n.*, b.naziv AS bicikl_naziv, k.id AS klijent_id, k.naziv AS klijent_naziv, k.telefon AS klijent_telefon
+    SELECT n.*, b.naziv AS bicikl_naziv, k.id AS klijent_id, k.naziv AS klijent_naziv, k.telefon AS klijent_telefon,
+           uo.ime AS otvorio_ime, ur.ime AS odradio_ime, up.ime AS predao_ime
     FROM nalog n
     JOIN bicikl b ON b.id = n.bicikl_id
     JOIN klijent k ON k.id = b.klijent_id
+    LEFT JOIN korisnik uo ON uo.id = n.otvorio_korisnik_id
+    LEFT JOIN korisnik ur ON ur.id = n.odradio_korisnik_id
+    LEFT JOIN korisnik up ON up.id = n.predao_korisnik_id
 """
 
 

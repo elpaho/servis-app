@@ -26,6 +26,7 @@ from PyQt6.QtCore import Qt
 
 import db
 from ui import theme
+from ui.dialogs import LoginDialog
 from ui.main_window import MainWindow
 from version import VERSION
 
@@ -34,7 +35,11 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(theme.STYLESHEET)
     conn = db.connect()
-    window = MainWindow(conn)
+    db.reset_lozinke_if_requested(conn)      # zaboravljena lozinka: vidi README
+    login = LoginDialog(conn)
+    if not login.exec():
+        sys.exit(0)
+    window = MainWindow(conn, login.korisnik_id)
 
     if paths.IS_COMPILED:
         # update i čišćenje starih verzija samo u kompajliranoj aplikaciji, nikad u razvoju

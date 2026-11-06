@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 import db
 from ui import theme
 from ui.common import APP_NAME, fmt_date
-from ui.dialogs import NalogDialog, NoviNalogDialog, PostavkeDialog
+from ui.dialogs import LoginDialog, NalogDialog, NoviNalogDialog, PostavkeDialog
 from version import VERSION
 
 TABS = [(db.STATUS_OTVOREN, "Otvoreni"), (db.STATUS_GOTOV, "Gotovi"), (db.STATUS_PREUZET, "Preuzeti")]
@@ -35,9 +35,13 @@ EMPTY_TEXT = {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, conn):
+    def __init__(self, conn, korisnik_id=None):
         super().__init__()
         self.conn = conn
+        if korisnik_id is None:
+            korisnik_id = db.list_korisnici(conn)[0]["id"]
+        self.korisnik_id = korisnik_id
+        self.korisnik_ime = db.get_korisnik(conn, korisnik_id)["ime"]
         self.data = {s: [] for s, _ in TABS}
         self.setWindowTitle(f"{APP_NAME} {VERSION}")
         self.resize(1100, 650)
@@ -51,11 +55,15 @@ class MainWindow(QMainWindow):
         self.btn_novi.setAutoDefault(False)
         btn_postavke = QPushButton("Postavke")
         btn_postavke.setAutoDefault(False)
+        self.user_label = QLabel()
+        self.btn_korisnik = QPushButton("Promijeni korisnika")
+        self.btn_korisnik.setAutoDefault(False)
 
         top = QHBoxLayout()
         top.addWidget(self.search, 1)
         top.addWidget(self.btn_novi)
         top.addWidget(btn_postavke)
+
 
         self.tabs = QTabBar()
         self.tabs.setExpanding(False)
@@ -78,8 +86,13 @@ class MainWindow(QMainWindow):
 
         box = QVBoxLayout()
         box.addLayout(top)
+        tab_row = QHBoxLayout()           # kartice lijevo, prijavljeni korisnik desno (štedi okomit prostor)
+        tab_row.addWidget(self.tabs)
+        tab_row.addStretch()
+        tab_row.addWidget(self.user_label)
+        tab_row.addWidget(self.btn_korisnik)
         box.addSpacing(6)
-        box.addWidget(self.tabs)
+        box.addLayout(tab_row)
         box.addWidget(self.table, 1)
         box.addWidget(self.empty)
         box.addWidget(self.status)
@@ -91,6 +104,8 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._render)
         self.btn_novi.clicked.connect(self.novi_nalog)
         btn_postavke.clicked.connect(self.postavke)
+        self.btn_korisnik.clicked.connect(self.promijeni_korisnika)
+        self._show_user()
         self.table.cellDoubleClicked.connect(lambda row, _c: self._open_row(row))
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self.novi_nalog)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: (self.search.setFocus(), self.search.selectAll()))
@@ -166,11 +181,11 @@ class MainWindow(QMainWindow):
         if row < 0 or self.table.item(row, 0) is None:
             return
         nalog_id = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
-        if NalogDialog(self.conn, nalog_id, self).exec():
+        if NalogDialog(self.conn, nalog_id, self, korisnik_id=self.korisnik_id).exec():
             self.refresh()
 
     def novi_nalog(self):
-        dlg = NoviNalogDialog(self.conn, self, start_text=self.search.text().strip())
+        dlg = NoviNalogDialog(self.conn, self, start_text=self.search.text().strip(), korisnik_id=self.korisnik_id)
         if dlg.exec():
             self.search.clear()
             self.tabs.setCurrentIndex(0)
@@ -179,5 +194,27 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Otvoren nalog {n['broj']}: {n['klijent_naziv']}, {n['bicikl_naziv']}.")
 
     def postavke(self):
-        if PostavkeDialog(self.conn, self).exec():
-            self.refresh()
+        PostavkeDialog(self.conn, self).exec()
+        self._reload_user()      # korisnik je mogao biti preimenovan ili deaktiviran
+        self.refresh()
+
+    def _show_user(self):
+        self.user_label.setText(f"Prijavljen: <b>{self.korisnik_ime}</b>")
+
+    def _reload_user(self):
+        u = db.get_korisnik(self.conn, self.korisnik_id)
+        if u is None or not u["aktivan"]:
+            # prijavljenog su u postavkama deaktivirali: traži novu prijavu
+            self.promijeni_korisnika(forced=True)
+        else:
+            self.korisnik_ime = u["ime"]
+            self._show_user()
+
+    def promijeni_korisnika(self, forced=False):
+        dlg = LoginDialog(self.conn, self, preselect_id=self.korisnik_id,
+                          cancel_text="Izlaz" if forced else "Odustani")
+        if dlg.exec():
+            self.korisnik_id, self.korisnik_ime = dlg.korisnik_id, dlg.ime
+            self._show_user()
+        elif forced:
+            self.close()

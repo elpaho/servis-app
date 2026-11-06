@@ -1,8 +1,9 @@
 """Dijalozi: novi nalog, detalji naloga, postavke."""
 from PyQt6.QtCore import QDate, Qt
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDateEdit, QDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout,
 )
 
 import db
@@ -42,9 +43,10 @@ def _text_edit(placeholder="", height=90):
 class NoviNalogDialog(QDialog):
     """Klijent (traži ili novi) -> bicikl (izaberi ili novi) -> opis i rok -> otvori nalog."""
 
-    def __init__(self, conn, parent=None, start_text=""):
+    def __init__(self, conn, parent=None, start_text="", korisnik_id=None):
         super().__init__(parent)
         self.conn = conn
+        self.korisnik_id = korisnik_id
         self.nalog_id = None
         self.klijent_id = None
         self.novi_klijent = False
@@ -219,7 +221,7 @@ class NoviNalogDialog(QDialog):
             klijent_id = db.add_klijent(self.conn, self.novi_naziv.text(), telefon=self.novi_telefon.text())
         bicikl_id = db.add_bicikl(self.conn, klijent_id, naziv_bicikla) if naziv_bicikla else self.bicikl_combo.currentData()
         rok = _iso(self.rok_edit.date()) if self.rok_check.isChecked() else None
-        self.nalog_id = db.open_nalog(self.conn, bicikl_id, self.opis.toPlainText(), rok=rok)
+        self.nalog_id = db.open_nalog(self.conn, bicikl_id, self.opis.toPlainText(), rok=rok, korisnik_id=self.korisnik_id)
         self.accept()
 
     def _err(self, text):
@@ -229,9 +231,10 @@ class NoviNalogDialog(QDialog):
 class NalogDialog(QDialog):
     """Detalji naloga. Otvoren: uredi i završi. Gotov: označi preuzet. Preuzet: samo pregled."""
 
-    def __init__(self, conn, nalog_id, parent=None):
+    def __init__(self, conn, nalog_id, parent=None, korisnik_id=None):
         super().__init__(parent)
         self.conn = conn
+        self.korisnik_id = korisnik_id          # prijavljeni korisnik
         self.nalog_id = nalog_id
         n = db.get_nalog(conn, nalog_id)
         self.status = n["status"]
@@ -250,6 +253,20 @@ class NalogDialog(QDialog):
             info.addRow("Završeno:", QLabel(fmt_date(n["datum_zavrsetka"])))
         if n["datum_preuzimanja"]:
             info.addRow("Preuzeto:", QLabel(fmt_date(n["datum_preuzimanja"])))
+        info.addRow("Otvorio:", QLabel(n["otvorio_ime"] or "—"))
+        self.odradio_combo = None
+        if self.status == db.STATUS_OTVOREN:
+            # tko je odradio: predodabran prijavljeni korisnik, ali se može promijeniti
+            self.odradio_combo = QComboBox()
+            for u in db.list_korisnici(conn):
+                self.odradio_combo.addItem(u["ime"], u["id"])
+            idx = self.odradio_combo.findData(korisnik_id)
+            self.odradio_combo.setCurrentIndex(max(idx, 0))
+            info.addRow("Odradio:", self.odradio_combo)
+        else:
+            info.addRow("Odradio:", QLabel(n["odradio_ime"] or "—"))
+        if self.status == db.STATUS_PREUZET:
+            info.addRow("Predao:", QLabel(n["predao_ime"] or "—"))
         self.warning = QLabel(n["upozorenje"])
         if n["upozorenje"]:
             self.warning.setStyleSheet("color: #A32D2D; font-weight: 600;")
@@ -336,12 +353,79 @@ class NalogDialog(QDialog):
             self.error.setText("Upiši što je napravljeno.")
             return
         self._save()
-        db.finish_nalog(self.conn, self.nalog_id, self.opis_radova.toPlainText())
+        db.finish_nalog(self.conn, self.nalog_id, self.opis_radova.toPlainText(),
+                        korisnik_id=self.odradio_combo.currentData() if self.odradio_combo else self.korisnik_id)
         self.accept()
 
     def _preuzet(self):
         self._save()
-        db.mark_preuzet(self.conn, self.nalog_id)
+        db.mark_preuzet(self.conn, self.nalog_id, korisnik_id=self.korisnik_id)
+        self.accept()
+
+
+class KorisnikDialog(QDialog):
+    """Novi korisnik ili uređivanje postojećeg (ime, lozinka, aktivnost)."""
+
+    def __init__(self, conn, korisnik_id=None, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.korisnik_id = korisnik_id
+        u = db.get_korisnik(conn, korisnik_id) if korisnik_id else None
+        self.setWindowTitle("Novi korisnik" if u is None else "Uredi korisnika")
+        self.setMinimumWidth(420)
+
+        self.ime = QLineEdit(u["ime"] if u else "")
+        self.lozinka = QLineEdit()
+        self.lozinka.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ponovi = QLineEdit()
+        self.ponovi.setEchoMode(QLineEdit.EchoMode.Password)
+        self.lozinka.setPlaceholderText("prazno = bez lozinke" if u is None else
+                                        ("nova lozinka (prazno = bez promjene)" if u["ima_lozinku"] else "prazno = bez lozinke"))
+        self.ukloni = QCheckBox("Ukloni lozinku (prijava bez lozinke)")
+        self.ukloni.setVisible(bool(u and u["ima_lozinku"]))
+        self.aktivan = QCheckBox("Aktivan (može se prijaviti)")
+        self.aktivan.setChecked(True if u is None else bool(u["aktivan"]))
+        self.aktivan.setVisible(u is not None)
+
+        form = QFormLayout()
+        form.addRow("Ime:", self.ime)
+        form.addRow("Lozinka:", self.lozinka)
+        form.addRow("Ponovi lozinku:", self.ponovi)
+        form.addRow("", self.ukloni)
+        form.addRow("", self.aktivan)
+        self.error = QLabel("")
+        self.error.setObjectName("error")
+        ok = QPushButton("Spremi")
+        ok.setObjectName("primary")
+        ok.setDefault(True)
+        ok.clicked.connect(self._save)
+        cancel = QPushButton("Odustani")
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addWidget(self.error, 1)
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        main = QVBoxLayout(self)
+        main.addLayout(form)
+        main.addLayout(row)
+
+    def _save(self):
+        if self.lozinka.text() != self.ponovi.text():
+            self.error.setText("Lozinke se ne podudaraju.")
+            return
+        try:
+            if self.korisnik_id is None:
+                self.korisnik_id = db.add_korisnik(self.conn, self.ime.text(), self.lozinka.text())
+            else:
+                db.update_korisnik(self.conn, self.korisnik_id, ime=self.ime.text(), aktivan=self.aktivan.isChecked())
+                if self.ukloni.isChecked():
+                    db.set_lozinka(self.conn, self.korisnik_id, "")
+                elif self.lozinka.text():
+                    db.set_lozinka(self.conn, self.korisnik_id, self.lozinka.text())
+        except ValueError as e:
+            self.error.setText(str(e))
+            return
         self.accept()
 
 
@@ -350,7 +434,7 @@ class PostavkeDialog(QDialog):
         super().__init__(parent)
         self.conn = conn
         self.setWindowTitle("Postavke")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(580)
         self.n = QSpinBox(); self.n.setRange(1, 90); self.n.setSuffix(" dana")
         self.m = QSpinBox(); self.m.setRange(0, 30); self.m.setSuffix(" dana")
         self.n.setValue(int(db.get_setting(conn, "dana_u_servisu")))
@@ -361,13 +445,150 @@ class PostavkeDialog(QDialog):
         form.addRow("Crveno ako je u servisu:", self.n)
         form.addRow("Žuto ako rok ističe za:", self.m)
         form.addRow("", self.auto)
+
+        # --- korisnici
+        self.users = QTableWidget(0, 3)
+        self.users.setHorizontalHeaderLabels(["Ime", "Lozinka", "Status"])
+        self.users.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.users.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.users.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.users.verticalHeader().hide()
+        self.users.horizontalHeader().setStretchLastSection(True)
+        self.users.setColumnWidth(0, 240)
+        self.users.setColumnWidth(1, 110)
+        self.users.setFixedHeight(150)
+        btn_add = QPushButton("+ Dodaj korisnika")
+        btn_edit = QPushButton("Uredi")
+        for b in (btn_add, btn_edit):
+            b.setAutoDefault(False)
+        hint = QLabel("Spremaju se odmah.")
+        hint.setObjectName("hint")
+        urow = QHBoxLayout()
+        urow.addWidget(hint, 1)
+        urow.addWidget(btn_edit)
+        urow.addWidget(btn_add)
+        box = QGroupBox("Korisnici")
+        bl = QVBoxLayout(box)
+        bl.addWidget(self.users)
+        bl.addLayout(urow)
+
         ok = QPushButton("Spremi"); ok.setObjectName("primary"); ok.clicked.connect(self._save)
         cancel = QPushButton("Odustani"); cancel.setAutoDefault(False); cancel.clicked.connect(self.reject)
         row = QHBoxLayout(); row.addStretch(); row.addWidget(cancel); row.addWidget(ok)
-        main = QVBoxLayout(self); main.addLayout(form); main.addLayout(row)
+        main = QVBoxLayout(self)
+        main.addLayout(form)
+        main.addWidget(box)
+        main.addLayout(row)
+
+        btn_add.clicked.connect(self._add_user)
+        btn_edit.clicked.connect(self._edit_user)
+        self.users.cellDoubleClicked.connect(lambda *_: self._edit_user())
+        self._fill_users()
+
+    def _fill_users(self):
+        rows = db.list_korisnici(self.conn, only_active=False)
+        self.users.setRowCount(len(rows))
+        for r, u in enumerate(rows):
+            cells = [u["ime"], "da" if u["ima_lozinku"] else "ne", "aktivan" if u["aktivan"] else "neaktivan"]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, u["id"])
+                if not u["aktivan"]:
+                    item.setForeground(Qt.GlobalColor.gray)
+                self.users.setItem(r, c, item)
+
+    def _add_user(self):
+        if KorisnikDialog(self.conn, None, self).exec():
+            self._fill_users()
+
+    def _edit_user(self):
+        row = self.users.currentRow()
+        if row < 0:
+            return
+        if KorisnikDialog(self.conn, self.users.item(row, 0).data(Qt.ItemDataRole.UserRole), self).exec():
+            self._fill_users()
 
     def _save(self):
         db.set_setting(self.conn, "dana_u_servisu", self.n.value())
         db.set_setting(self.conn, "dana_do_roka", self.m.value())
         db.set_setting(self.conn, "auto_preuzet", 1 if self.auto.isChecked() else 0)
+        self.accept()
+
+
+class LoginDialog(QDialog):
+    """
+    Prijava: izbor korisnika; lozinka se traži samo ako je korisnik ima.
+    Pri pokretanju (cancel_text="Izlaz") zatvaranje znači izlaz iz aplikacije; pri promjeni
+    korisnika (cancel_text="Odustani") ostaje prijavljen prethodni.
+    """
+
+    def __init__(self, conn, parent=None, preselect_id=None, cancel_text="Izlaz"):
+        super().__init__(parent)
+        self.conn = conn
+        self.korisnik_id = None
+        self.ime = ""
+        self.setWindowTitle("Prijava")
+        self.setMinimumWidth(380)
+
+        self.combo = QComboBox()
+        self._ima_lozinku = {}
+        for u in db.list_korisnici(conn):
+            self.combo.addItem(u["ime"], u["id"])
+            self._ima_lozinku[u["id"]] = bool(u["ima_lozinku"])
+        want = preselect_id
+        if want is None:
+            zadnji = db.get_setting(conn, "zadnji_korisnik")
+            want = int(zadnji) if zadnji.isdigit() else None
+        self.combo.setCurrentIndex(max(self.combo.findData(want), 0))
+
+        self.lozinka = QLineEdit()
+        self.lozinka.setEchoMode(QLineEdit.EchoMode.Password)
+        self.lozinka.setPlaceholderText("Lozinka")
+        self.error = QLabel("")
+        self.error.setObjectName("error")
+
+        ok = QPushButton("Prijava")
+        ok.setObjectName("primary")
+        ok.setDefault(True)
+        cancel = QPushButton(cancel_text)
+        cancel.setAutoDefault(False)
+        ok.clicked.connect(self._login)
+        cancel.clicked.connect(self.reject)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(cancel)
+        row.addWidget(ok)
+
+        main = QVBoxLayout(self)
+        title = QLabel("Tko radi?")
+        title.setStyleSheet("font-size: 14pt; font-weight: 600;")
+        main.addWidget(title)
+        main.addWidget(self.combo)
+        main.addWidget(self.lozinka)
+        main.addWidget(self.error)
+        main.addLayout(row)
+
+        self.combo.currentIndexChanged.connect(self._user_changed)
+        self._user_changed()
+
+    def _user_changed(self, *_):
+        needs = self._ima_lozinku.get(self.combo.currentData(), False)
+        self.lozinka.setVisible(needs)
+        self.lozinka.clear()
+        self.error.setText("")
+        if needs:
+            self.lozinka.setFocus()
+
+    def _login(self):
+        kid = self.combo.currentData()
+        if kid is None:
+            return
+        if not db.check_lozinka(self.conn, kid, self.lozinka.text()):
+            self.error.setText("Pogrešna lozinka.")
+            self.lozinka.clear()
+            self.lozinka.setFocus()
+            return
+        self.korisnik_id, self.ime = kid, self.combo.currentText()
+        db.set_setting(self.conn, "zadnji_korisnik", kid)
         self.accept()

@@ -39,18 +39,25 @@ rezultata, ispiše se da ih potražiš u drugim karticama. Popis se sam osvježa
 | `Esc` | briše pretragu |
 | dvoklik ili `Enter` na retku | detalji naloga |
 
+**Prijava:** pri pokretanju se uvijek nudi prijava (predodabran je zadnji prijavljeni korisnik,
+na prvom pokretanju prvi korisnik "Serviser"). Korisnik bez lozinke se prijavljuje samo s **Prijava**,
+a tko lozinku ima, mora je upisati. U gornjem desnom kutu piše tko je prijavljen, a **Promijeni
+korisnika** omogućuje zamjenu bez gašenja aplikacije. Prijava služi za bilježenje *tko je što
+napravio*, ne kao sigurnosna zaštita.
+
 **Novi nalog** (jedan prozor): upiši dio imena ili telefona klijenta; ako je samo jedan rezultat,
 odabire se sam. `Enter` u pretrazi odabire prvog i skače na bicikl. Ako klijenta nema,
 **+ Novi klijent** (ime se prenese iz pretrage). Bicikl se izabere s popisa klijentovih ili upiše novi.
 Zatim opis i po želji rok (kvačica "Dogovoren rok"; datum zaprimanja je današnji).
 
 **Detalji naloga:** otvoren nalog se uređuje (rok, opis), a **Završi nalog** traži unos što je
-napravljeno. Otvoren nalog se može i **obrisati** (gumb "Obriši nalog", uz pitanje "jeste li sigurni",
+napravljeno i tko je to odradio (predodabran je prijavljeni korisnik, može se promijeniti). Otvoren nalog se može i **obrisati** (gumb "Obriši nalog", uz pitanje "jeste li sigurni",
 default je "Ne"); to se ne može poništiti. Gotovi i preuzeti nalozi se ne brišu, čuvaju se kao povijest.
 Gotov nalog ima **Označi kao preuzet**. Preuzet je samo za pregled.
 
 **Postavke:** koliko dana u servisu je crveno (N), koliko dana do roka je žuto (M),
-i automatsko označavanje kao preuzet pri završetku.
+automatsko označavanje kao preuzet pri završetku, i **tablica korisnika** (dodavanje, uređivanje
+imena i lozinke, deaktivacija; promjene se spremaju odmah).
 
 Entiteti: **klijent**, **bicikl**, **servisni nalog**, **korisnik**.
 Opisi na nalogu su slobodan tekst (što je rekao klijent, što je napravljeno),
@@ -188,8 +195,8 @@ Datoteka: `FAMILY_ROOT\data\servis.db` (SQLite). Kod: `db.py`, testovi: `test_db
 |---|---|
 | `klijent` | naziv, telefon, email, napomena, `naziv_pretraga` (normalizirano za pretragu), aktivan |
 | `bicikl` | klijent_id, naziv, napomena, aktivan |
-| `nalog` | broj, bicikl_id, datum_zaprimanja, rok, datum_zavrsetka, datum_preuzimanja, status, opis_klijent, opis_radova, otvorio/zatvorio korisnik |
-| `korisnik` | ime, pin_hash (PBKDF2, PIN nije prazan tekst), aktivan |
+| `nalog` | broj, bicikl_id, datum_zaprimanja, rok, datum_zavrsetka, datum_preuzimanja, status, opis_klijent, opis_radova, `otvorio_korisnik_id`, `odradio_korisnik_id`, `predao_korisnik_id` |
+| `korisnik` | ime, lozinka_hash (PBKDF2, lozinka nije prazan tekst; prazno = bez lozinke), aktivan |
 | `postavke` | ključ/vrijednost (vidi dolje) |
 
 Pravila:
@@ -227,10 +234,18 @@ Svaka upisana riječ mora se pojaviti u nazivu.
 - Ako je baza novije verzije nego što aplikacija zna (netko je pokrenuo staru
   verziju), aplikacija odbija raditi s bazom i traži update. Ne dira podatke.
 
-### Korisnici `[OTVORENO]`
-Tablica `korisnik` (ime + PIN hash) i funkcije za PIN postoje u `db.py`, ali **prijave još nema**
-u sučelju: nalozi se trenutno otvaraju bez zapisa tko ih je otvorio/zatvorio. Treba odlučiti
-treba li uopće (jedna ili dvije osobe u servisu?).
+### Korisnici
+- Prvi korisnik **"Serviser"** (bez lozinke) nastaje sam pri migraciji, ako korisnika još nema.
+  Može se preimenovati u Postavkama.
+- **Tko je što napravio** na nalogu: *otvorio* (prijavljeni korisnik pri otvaranju), *odradio*
+  (biran pri završetku, predodabran prijavljeni), *predao* (prijavljeni korisnik pri označavanju
+  preuzetim; ako je uključen `auto_preuzet`, *predao* je isti kao *odradio*). Nalozi nastali prije
+  uvođenja korisnika imaju te podatke prazne (prikazuje se "—").
+- Korisnici se **ne brišu**, samo deaktiviraju (zbog povijesti naloga). Zadnji aktivni korisnik se
+  ne može deaktivirati. Imena moraju biti jedinstvena (bez obzira na velika slova i dijakritike).
+- Prijava nije sigurnosna zaštita nego bilježenje autorstva.
+- **Zaboravljena lozinka:** u mapu `data\` stavi praznu datoteku `reset_lozinki.txt` i pokreni
+  aplikaciju. Svim korisnicima se briše lozinka, a datoteka se sama ukloni.
 
 ### Backup `[OTVORENO]`
 Planirano: dnevna kopija `servis.db` u `data\backup\` (zadnjih X dana).
@@ -258,6 +273,7 @@ Računalu treba internet samo za update; aplikacija bez njega radi, baza je loka
   `vX.YY\servis.exe`; detalji su u `launcher.log` uz launcher.
 - **Update se ne dohvaća:** provjeriti internet; `cacert.pem` mora biti uz `servis.exe`.
   Pokrenuti build s `--debug-console` da se vide poruke `[update]`.
+- **Zaboravljena lozinka:** vidi odjeljak "Korisnici" u 7 (datoteka `reset_lozinki.txt`).
 - **Antivirus blokira:** dodati iznimku za mapu `C:\Servis`.
 
 ---
@@ -280,3 +296,6 @@ Računalu treba internet samo za update; aplikacija bez njega radi, baza je loka
 | 2026-11-06 | Naziv prozora: "Servis bicikala Gema" + verzija (konstanta `APP_NAME` u `ui/common.py`) |
 | 2026-11-06 | Brisanje: samo otvoreni nalozi, uz potvrdu; broj obrisanog naloga se ne ponavlja |
 | 2026-11-06 | Veličina slova u stilu u `pt` umjesto `px` (poruka "QFont::setPointSize: Point size <= 0" na Windowsu) |
+| 2026-11-06 | Korisnici i prijava pri pokretanju: prvi korisnik "Serviser" bez lozinke; lozinka se traži samo ako postoji |
+| 2026-11-06 | Nalog bilježi tri korisnika: otvorio, odradio, predao (predao = odradio kod `auto_preuzet`). Migracija 2 preimenuje `zatvorio_korisnik_id` u `odradio_korisnik_id` |
+| 2026-11-06 | Dodano (nije traženo): gumb "Promijeni korisnika", izbor "odradio" pri završetku, `reset_lozinki.txt` za zaboravljenu lozinku |

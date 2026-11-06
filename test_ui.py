@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import QApplication
 
 import db
 from ui import theme
-from ui.dialogs import NalogDialog, NoviNalogDialog, PostavkeDialog
+from ui.dialogs import KorisnikDialog, LoginDialog, NalogDialog, NoviNalogDialog, PostavkeDialog
 from ui.common import APP_NAME
 from ui.main_window import MainWindow
 from version import VERSION
@@ -113,5 +113,93 @@ db.open_nalog(conn, b, "x"); g_id = db.list_nalozi(conn, "otvoren")[-1]["id"]
 db.finish_nalog(conn, g_id, "gotovo")                               # gotov nalog: nema gumba za brisanje
 gd = NalogDialog(conn, g_id)
 assert not any(bt.text() == "Obriši nalog" for bt in gd.findChildren(QPushButton))
+
+# =================== korisnici i prijava ===================
+conn2 = db.connect(os.path.join(tempfile.mkdtemp(), "login.db"))
+serviser = db.list_korisnici(conn2)[0]["id"]
+
+# prvi korisnik je ponuđen, nema polja za lozinku, Prijava radi bez nje
+ld = LoginDialog(conn2)
+assert ld.combo.count() == 1 and ld.combo.currentText() == "Serviser" and ld.lozinka.isHidden()
+ld._login()
+assert ld.korisnik_id == serviser and ld.ime == "Serviser" and ld.result() == 1
+
+# novi korisnik s lozinkom kroz dijalog: lozinke se moraju podudarati, ime ne smije biti zauzeto
+kd = KorisnikDialog(conn2)
+kd.ime.setText("Ana"); kd.lozinka.setText("tajna"); kd.ponovi.setText("druga")
+kd._save(); assert "podudaraju" in kd.error.text() and kd.result() == 0
+kd.ponovi.setText("tajna"); kd.ime.setText("serviser")
+kd._save(); assert "već postoji" in kd.error.text() and kd.result() == 0
+kd.ime.setText("Ana"); kd._save()
+assert kd.result() == 1
+ana = [r["id"] for r in db.list_korisnici(conn2) if r["ime"] == "Ana"][0]
+
+# prijava s lozinkom: polje se pojavi samo za korisnika koji je ima; kriva lozinka ne prolazi
+ld = LoginDialog(conn2)
+assert ld.combo.currentText() == "Serviser" and ld.lozinka.isHidden()      # zadnji prijavljeni (Serviser)
+ld.combo.setCurrentIndex(ld.combo.findText("Ana"))
+assert not ld.lozinka.isHidden()
+ld.lozinka.setText("kriva"); ld._login()
+assert ld.korisnik_id is None and "Pogrešna" in ld.error.text() and ld.lozinka.text() == ""
+ld.lozinka.setText("tajna"); ld._login()
+assert ld.korisnik_id == ana and ld.result() == 1
+assert db.get_setting(conn2, "zadnji_korisnik") == str(ana)
+ld2 = LoginDialog(conn2)                                                    # sljedeći put je predodabrana Ana
+assert ld2.combo.currentText() == "Ana" and not ld2.lozinka.isHidden()
+
+# uređivanje: ukloni lozinku, promjena imena, deaktivacija zadnjeg aktivnog se odbija
+kd = KorisnikDialog(conn2, ana); kd.ukloni.setChecked(True); kd.ime.setText("Ana M."); kd._save()
+assert db.get_korisnik(conn2, ana)["ime"] == "Ana M." and not db.get_korisnik(conn2, ana)["ima_lozinku"]
+db.update_korisnik(conn2, serviser, aktivan=False)
+kd = KorisnikDialog(conn2, ana); kd.aktivan.setChecked(False); kd._save()
+assert "barem jedan" in kd.error.text() and db.get_korisnik(conn2, ana)["aktivan"] == 1
+db.update_korisnik(conn2, serviser, aktivan=True)
+
+# --- tri korisnika na nalogu kroz sučelje: otvorio (Serviser), odradio (Ana, izabran u izborniku), predao (Serviser)
+w2 = MainWindow(conn2, serviser)
+assert "Serviser" in w2.user_label.text()
+nk = db.add_klijent(conn2, "Klijent"); nb = db.add_bicikl(conn2, nk, "Bicikl")
+nd = NoviNalogDialog(conn2, w2, korisnik_id=serviser)
+nd.search.setText("klijent"); nd.opis.setPlainText("x"); nd._submit()
+assert db.get_nalog(conn2, nd.nalog_id)["otvorio_ime"] == "Serviser"
+dd = NalogDialog(conn2, nd.nalog_id, w2, korisnik_id=serviser)
+assert dd.odradio_combo.currentText() == "Serviser"                          # predodabran prijavljeni
+dd.odradio_combo.setCurrentIndex(dd.odradio_combo.findText("Ana M."))
+dd.opis_radova.setPlainText("servis gotov"); dd._finish()
+g = db.get_nalog(conn2, nd.nalog_id)
+assert (g["otvorio_ime"], g["odradio_ime"], g["predao_ime"]) == ("Serviser", "Ana M.", None) and g["status"] == "gotov"
+dd = NalogDialog(conn2, nd.nalog_id, w2, korisnik_id=serviser)
+assert dd.odradio_combo is None                                              # gotov: odradio je samo prikaz
+dd._preuzet()
+g = db.get_nalog(conn2, nd.nalog_id)
+assert (g["odradio_ime"], g["predao_ime"]) == ("Ana M.", "Serviser") and g["status"] == "preuzet"
+
+# auto_preuzet: predao = odradio
+db.set_setting(conn2, "auto_preuzet", 1)
+nd2 = NoviNalogDialog(conn2, w2, korisnik_id=serviser); nd2.search.setText("klijent"); nd2._submit()
+dd = NalogDialog(conn2, nd2.nalog_id, w2, korisnik_id=serviser)
+dd.odradio_combo.setCurrentIndex(dd.odradio_combo.findText("Ana M.")); dd.opis_radova.setPlainText("ok"); dd._finish()
+g = db.get_nalog(conn2, nd2.nalog_id); assert g["odradio_ime"] == g["predao_ime"] == "Ana M."
+
+# --- promjena korisnika u glavnom prozoru (LoginDialog.exec zamijenjen odabirom Ane)
+orig_exec = LoginDialog.exec
+def fake_exec(self):
+    self.combo.setCurrentIndex(self.combo.findData(ana)); self._login(); return 1
+LoginDialog.exec = fake_exec
+w2.promijeni_korisnika()
+assert w2.korisnik_id == ana and "Ana M." in w2.user_label.text()
+# deaktiviranje prijavljenog korisnika u postavkama traži novu prijavu
+db.update_korisnik(conn2, ana, aktivan=False)
+called = []
+w2.promijeni_korisnika = lambda forced=False: called.append(forced)
+w2._reload_user(); assert called == [True]
+LoginDialog.exec = orig_exec
+
+# --- tablica korisnika u postavkama
+pd2 = PostavkeDialog(conn2)
+assert pd2.users.rowCount() == 2
+imena = [pd2.users.item(r, 0).text() for r in range(2)]
+statusi = [pd2.users.item(r, 2).text() for r in range(2)]
+assert imena == ["Serviser", "Ana M."] and statusi == ["aktivan", "neaktivan"]
 
 print("SVI TESTOVI PROŠLI (test_ui)")
