@@ -1,0 +1,7 @@
+data/
+dist_servis/
+dist_launcher/
+__pycache__/
+*.pyc
+local_config.json
+cacert.pem
