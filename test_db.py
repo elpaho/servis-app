@@ -34,10 +34,13 @@ rows = [r for r in rows if r["broj"].startswith("2026")]
 out = [(r["broj"], r["upozorenje"]) for r in rows]
 print(out)
 assert out[0] == ("2026-0004", "11 dana u servisu")            # crveno, najstariji
-assert out[1] == ("2026-0002", "Kasni 1 dan(a) · 9 dana u servisu")  # crveno
-assert out[2] == ("2026-0001", "Rok za 1 dan(a)")              # žuto
+assert out[1] == ("2026-0002", "Kasni 1 dan · 9 dana u servisu")  # crveno
+assert out[2] == ("2026-0001", "Rok za 1 dan")              # žuto
 assert out[3] == ("2026-0003", "")
 assert [r["boja"] for r in rows] == ["crvena", "crvena", "zuta", ""]
+
+assert [db.dana(n) for n in (0,1,2,4,5,11,12,21,22,25,101,111)] == \
+    ["0 dana","1 dan","2 dana","4 dana","5 dana","11 dana","12 dana","21 dan","22 dana","25 dana","101 dan","111 dana"]
 
 # završetak + preuzimanje, ručno
 db.finish_nalog(conn, n1, "zamijenjen lanac", korisnik_id=u, today=today)
@@ -50,6 +53,31 @@ assert conn.execute("SELECT status FROM nalog WHERE id=?", (n1,)).fetchone()[0] 
 db.set_setting(conn, "auto_preuzet", 1)
 db.finish_nalog(conn, n3, "gume", today=today)
 assert conn.execute("SELECT status FROM nalog WHERE id=?", (n3,)).fetchone()[0] == "preuzet"
+
+# get_nalog / update_nalog
+g = db.get_nalog(conn, n2, today)
+assert g["klijent_naziv"] == "Đuro Šimić" and g["bicikl_naziv"] == "Scott Addict" and g["boja"] == "crvena"
+assert db.get_nalog(conn, 99999) is None
+db.update_nalog(conn, n2, None, "  kočnice i lanac ", "gotovo")
+g = db.get_nalog(conn, n2, today)
+assert g["rok"] is None and g["opis_klijent"] == "kočnice i lanac" and g["opis_radova"] == "gotovo" and g["status"] == "otvoren"
+
+# brisanje: samo otvoreni, a broj obrisanog naloga se ne izdaje ponovno
+x = db.open_nalog(conn, b1, "za brisanje", today=today)
+broj_x = db.get_nalog(conn, x)["broj"]
+db.delete_nalog(conn, x)
+assert db.get_nalog(conn, x) is None
+y = db.open_nalog(conn, b1, "idući", today=today)
+assert db.get_nalog(conn, y)["broj"] != broj_x
+for bad_id in (n1, n3):                       # n1 je preuzet, n3 preuzet (auto_preuzet)
+    try:
+        db.delete_nalog(conn, bad_id); assert False
+    except ValueError as e:
+        assert "otvoreni" in str(e)
+try:
+    db.delete_nalog(conn, 999999); assert False
+except ValueError:
+    pass
 
 # integritet: bicikl mora imati klijenta
 try:

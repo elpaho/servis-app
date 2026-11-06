@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -46,6 +47,7 @@ class UpdateChecker(QObject):
     check_failed = pyqtSignal(str)
 
     progress = pyqtSignal(int)             # -1 = neodređeno, 0-100 = %
+    stage = pyqtSignal(str)                # tekst koraka za prozor napretka
     download_done = pyqtSignal(bool, str)  # uspjeh, udaljena verzija ili poruka greške
 
     def check_for_update(self):
@@ -86,6 +88,8 @@ class UpdateChecker(QObject):
                         downloaded += len(chunk)
                         self.progress.emit(int(downloaded * 100 / total) if total else -1)
 
+            self.stage.emit("Raspakiravam…")
+            self.progress.emit(-1)
             with zipfile.ZipFile(tmp_path, "r") as zf:
                 zf.extractall(target_dir)
 
@@ -117,17 +121,44 @@ class UpdateWorker(QThread):
             self.checker.download_and_install(self.remote_version)
 
 
-def apply_update_and_restart(remote_version: str):
+def apply_update_and_restart(remote_version: str, pump=None):
     """
     Zove se NAKON uspješnog download_and_install(). Prepiše current.txt (atomično),
-    pokrene novi exe direktno i ugasi ovaj proces (os._exit, ne os.execv - Windows).
+    pokrene novi exe i ugasi ovaj proces (os._exit, ne os.execv - Windows).
+
+    Pokretanje novog exe-a ide na ZASEBNOJ niti: na svježe raspakiranoj mapi Windows
+    Defender zna blokirati CreateProcess nekoliko sekundi, a da je to na GUI niti,
+    prozor bi bio "Not responding". `pump` (npr. QApplication.processEvents) se
+    poziva dok čekamo, da prozor ostane živ.
     """
     new_exe = os.path.join(paths.family_root(), remote_version, APP_EXE_NAME)
     if not os.path.isfile(new_exe):
         raise FileNotFoundError(f"Novi exe nije pronađen na {new_exe}")
     ul.write_pointer(paths.family_root(), remote_version)
-    time.sleep(0.3)  # da se Qt prozori stignu zatvoriti
-    subprocess.Popen([new_exe], cwd=os.path.dirname(new_exe))
+
+    result = {}
+
+    def _start():
+        try:
+            subprocess.Popen([new_exe], cwd=os.path.dirname(new_exe))
+        except Exception as e:  # noqa: BLE001
+            result["error"] = e
+
+    t = threading.Thread(target=_start, daemon=True)
+    t.start()
+
+    def _wait(seconds: float):
+        end = time.time() + seconds
+        while time.time() < end:
+            if pump:
+                pump()
+            time.sleep(0.05)
+
+    while t.is_alive():
+        _wait(0.05)
+    if "error" in result:
+        raise result["error"]
+    _wait(2.0)  # novi prozor treba koju sekundu da se pojavi; stari ostaje do tada
     os._exit(0)
 
 

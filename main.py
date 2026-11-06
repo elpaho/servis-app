@@ -21,40 +21,24 @@ if paths.IS_COMPILED:
         os.environ["SSL_CERT_FILE"] = _bundled_cacert
         os.environ["REQUESTS_CA_BUNDLE"] = _bundled_cacert
 
-from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QMessageBox, QProgressDialog, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 from PyQt6.QtCore import Qt
 
 import db
+from ui import theme
+from ui.main_window import MainWindow
 from version import VERSION
-
-
-class MainWindow(QMainWindow):
-    """PRIVREMENI kostur: pokazuje da baza i verzija rade. Pravi ekrani dolaze kasnije."""
-
-    def __init__(self, conn):
-        super().__init__()
-        self.conn = conn
-        self.setWindowTitle(f"Servis {VERSION}")
-        self.resize(900, 600)
-        box = QVBoxLayout()
-        box.addWidget(QLabel(f"Servis {VERSION}"))
-        otvoreni = len(db.list_nalozi(conn, db.STATUS_OTVOREN))
-        box.addWidget(QLabel(f"Otvorenih naloga: {otvoreni}"))
-        box.addWidget(QLabel(f"Podaci: {db.get_data_dir()}"))
-        box.addStretch()
-        central = QWidget()
-        central.setLayout(box)
-        self.setCentralWidget(central)
 
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyleSheet(theme.STYLESHEET)
     conn = db.connect()
     window = MainWindow(conn)
 
     if paths.IS_COMPILED:
         # update i čišćenje starih verzija samo u kompajliranoj aplikaciji, nikad u razvoju
-        from updater import UpdateChecker, UpdateWorker, cleanup_in_background
+        from updater import cleanup_in_background
         cleanup_in_background()
         _start_update_check(app, window)
 
@@ -84,34 +68,41 @@ def _start_update_check(app, window):
 def _download_update(window, checker, remote_version: str):
     from updater import UpdateWorker, apply_update_and_restart
 
-    progress = QProgressDialog("Skidam novu verziju...", None, 0, 100, window)
+    progress = QProgressDialog("Skidam novu verziju…", None, 0, 100, window)
     progress.setWindowTitle("Ažuriranje")
     progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+    progress.setAutoClose(False)   # inače se dialog sam zatvori na 100%, a raspakiravanje još traje
+    progress.setAutoReset(False)
     progress.setMinimumDuration(0)
     progress.setValue(0)
     progress.show()
 
     def on_progress(pct: int):
         if pct < 0:
-            progress.setMaximum(0)
+            progress.setMaximum(0)  # neodređeno
         else:
             if progress.maximum() == 0:
                 progress.setMaximum(100)
             progress.setValue(pct)
 
     def on_done(success: bool, message: str):
-        progress.close()
         if success:
-            QMessageBox.information(window, "Ažuriranje", "Nova verzija je skinuta. Aplikacija će se ponovno pokrenuti.")
+            progress.setLabelText("Pokrećem novu verziju…")
+            progress.setMaximum(0)
+            QApplication.processEvents()
             try:
-                apply_update_and_restart(remote_version)
-            except FileNotFoundError as e:
+                apply_update_and_restart(remote_version, pump=QApplication.processEvents)
+            except Exception as e:  # noqa: BLE001
+                progress.close()
                 QMessageBox.critical(window, "Ažuriranje nije uspjelo", str(e))
         else:
-            # nije kritično: aplikacija nastavlja raditi na trenutnoj verziji, update se ponavlja pri idućem pokretanju
+            progress.close()
+            # nije kritično: aplikacija nastavlja raditi na trenutnoj verziji,
+            # a update se ponavlja pri idućem pokretanju
             QMessageBox.warning(window, "Ažuriranje nije uspjelo", f"Radim dalje na trenutnoj verziji.\n\n{message}")
 
     checker.progress.connect(on_progress)
+    checker.stage.connect(progress.setLabelText)
     checker.download_done.connect(on_done)
 
     worker = UpdateWorker(checker, mode="download", remote_version=remote_version)

@@ -224,11 +224,22 @@ def check_pin(conn, korisnik_id: int, pin: str) -> bool:
 
 # ---------------------------------------------------------------- nalozi
 def _next_broj(conn, year: int) -> str:
+    """
+    GODINA-NNNN. Uz najveći postojeći broj pamti se i zadnje izdani broj (postavke),
+    pa se broj obrisanog naloga nikad ne izdaje ponovno.
+    """
     prefix = f"{year}-"
     row = conn.execute(
         "SELECT MAX(CAST(SUBSTR(broj, 6) AS INTEGER)) AS m FROM nalog WHERE broj LIKE ?", (prefix + "%",)
     ).fetchone()
-    return f"{prefix}{(row['m'] or 0) + 1:04d}"
+    key = f"zadnji_broj_{year}"
+    stored = conn.execute("SELECT vrijednost FROM postavke WHERE kljuc = ?", (key,)).fetchone()
+    n = max(row["m"] or 0, int(stored["vrijednost"]) if stored else 0) + 1
+    conn.execute(
+        "INSERT INTO postavke(kljuc, vrijednost) VALUES (?, ?) "
+        "ON CONFLICT(kljuc) DO UPDATE SET vrijednost = excluded.vrijednost", (key, str(n)),
+    )
+    return f"{prefix}{n:04d}"
 
 
 def open_nalog(conn, bicikl_id, opis_klijent="", rok=None, korisnik_id=None, today: date = None) -> int:
@@ -257,6 +268,17 @@ def finish_nalog(conn, nalog_id, opis_radova, korisnik_id=None, today: date = No
     conn.commit()
 
 
+def delete_nalog(conn, nalog_id: int):
+    """Trajno briše nalog. Dopušteno SAMO za otvorene naloge; gotove i preuzete čuvamo kao povijest."""
+    row = conn.execute("SELECT status FROM nalog WHERE id = ?", (nalog_id,)).fetchone()
+    if row is None:
+        raise ValueError("Nalog ne postoji.")
+    if row["status"] != STATUS_OTVOREN:
+        raise ValueError("Brisati se mogu samo otvoreni nalozi.")
+    conn.execute("DELETE FROM nalog WHERE id = ?", (nalog_id,))
+    conn.commit()
+
+
 def mark_preuzet(conn, nalog_id, today: date = None):
     today = today or date.today()
     conn.execute(
@@ -274,10 +296,30 @@ _NALOG_SELECT = """
 """
 
 
+def get_nalog(conn, nalog_id: int, today: date = None):
+    """Jedan nalog sa svim poljima (+ klijent, bicikl, zastavice isticanja), ili None."""
+    row = conn.execute(_NALOG_SELECT + " WHERE n.id = ?", (nalog_id,)).fetchone()
+    return _with_flags(conn, row, today) if row else None
+
+
+def update_nalog(conn, nalog_id, rok, opis_klijent, opis_radova):
+    """Izmjena roka (None = bez roka) i opisa; status se ne mijenja."""
+    conn.execute(
+        "UPDATE nalog SET rok = ?, opis_klijent = ?, opis_radova = ? WHERE id = ?",
+        (rok or None, opis_klijent.strip(), opis_radova.strip(), nalog_id),
+    )
+    conn.commit()
+
+
 def list_nalozi(conn, status: str, today: date = None):
     """Nalozi za pregled sa zastavicama isticanja. status: otvoren | gotov | preuzet."""
     rows = conn.execute(_NALOG_SELECT + " WHERE n.status = ? ORDER BY n.datum_zaprimanja", (status,)).fetchall()
     return [_with_flags(conn, r, today) for r in rows]
+
+
+def dana(n: int) -> str:
+    """'1 dan', '2 dana', '11 dana', '21 dan', '22 dana'."""
+    return f"{n} {'dan' if n % 10 == 1 and n % 100 != 11 else 'dana'}"
 
 
 def _with_flags(conn, row, today: date = None) -> dict:
@@ -300,13 +342,13 @@ def _with_flags(conn, row, today: date = None) -> dict:
     if d["rok"]:
         do_roka = (date.fromisoformat(d["rok"]) - today).days
         if do_roka < 0:
-            texts.append(f"Kasni {-do_roka} dan(a)")
+            texts.append(f"Kasni {dana(-do_roka)}")
             d["hitnost"] = 3
         elif do_roka <= m:
-            texts.append("Rok danas" if do_roka == 0 else f"Rok za {do_roka} dan(a)")
+            texts.append("Rok danas" if do_roka == 0 else f"Rok za {dana(do_roka)}")
             d["hitnost"] = 2
     if d["dana_u_servisu"] >= n:
-        texts.append(f"{d['dana_u_servisu']} dana u servisu")
+        texts.append(f"{dana(d['dana_u_servisu'])} u servisu")
         d["hitnost"] = 3
     d["upozorenje"] = " · ".join(texts)
     d["boja"] = {3: "crvena", 2: "zuta"}.get(d["hitnost"], "")
